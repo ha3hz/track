@@ -76,16 +76,36 @@ export default function App() {
   // ─── CLOCK ───
   useEffect(function() { var t = setInterval(function() { setClock(now12()); }, 1000); return function() { clearInterval(t); }; }, []);
 
-  // ─── POLLING SYNC (every 3s for timer, 8s for data) ───
+  // ─── SERVER TIME OFFSET ───
+  // Calculate difference between local clock and server clock
+  var serverOffsetRef = useRef(0);
+  useEffect(function() {
+    var before = Date.now();
+    sb(T_TIMER, "GET", null, "id=eq.main&select=updated_at").then(function(r) {
+      if (r && r.length > 0 && r[0].updated_at) {
+        var after = Date.now();
+        var roundTrip = after - before;
+        var serverTime = new Date(r[0].updated_at).getTime() + roundTrip / 2;
+        serverOffsetRef.current = serverTime - after;
+      }
+    });
+  }, []);
+
+  function serverNow() {
+    return Date.now() + serverOffsetRef.current;
+  }
+
+  // ─── POLLING SYNC (every 1s for timer to keep all devices in sync) ───
   useEffect(function() {
     var t1 = setInterval(function() {
       sb(T_TIMER, "GET", null, "id=eq.main").then(function(r) {
         if (r && r.length > 0) setTimer(function(prev) {
-          if (prev.timer_status !== r[0].timer_status || prev.started_at !== r[0].started_at || prev.paused_remaining !== r[0].paused_remaining) return r[0];
+          var n = r[0];
+          if (prev.timer_status !== n.timer_status || prev.started_at !== n.started_at || prev.paused_remaining !== n.paused_remaining || prev.session_type !== n.session_type || prev.cycle_number !== n.cycle_number || prev.session_in_cycle !== n.session_in_cycle) return n;
           return prev;
         });
       });
-    }, 3000);
+    }, 1500);
     var t2 = setInterval(function() {
       sb(T_LOG, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(r) { if (r && Array.isArray(r)) setLogs(r); });
       sb(T_POMO, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(r) { if (r && Array.isArray(r)) setPomos(r); });
@@ -93,11 +113,13 @@ export default function App() {
     return function() { clearInterval(t1); clearInterval(t2); };
   }, []);
 
-  // ─── TIMER TICK ───
+  // ─── TIMER TICK (uses server time offset for precision) ───
   useEffect(function() {
     function calc() {
       if (timer.timer_status === "running" && timer.started_at) {
-        var elapsed = Math.floor((Date.now() - new Date(timer.started_at).getTime()) / 1000);
+        var startedMs = new Date(timer.started_at).getTime();
+        var nowMs = serverNow();
+        var elapsed = Math.floor((nowMs - startedMs) / 1000);
         var rem = Math.max(0, timer.duration_seconds - elapsed);
         setSecs(rem);
         if (rem <= 0) onTimerDone();
@@ -110,7 +132,7 @@ export default function App() {
       }
     }
     calc();
-    tickRef.current = setInterval(calc, 1000);
+    tickRef.current = setInterval(calc, 500);
     return function() { clearInterval(tickRef.current); };
   }, [timer]);
 
@@ -124,9 +146,9 @@ export default function App() {
 
   // ─── TIMER CONTROLS ───
   function updateTimer(fields) {
-    var updated = Object.assign({}, timer, fields, { updated_at: new Date().toISOString() });
-    setTimer(updated);
-    sb(T_TIMER, "PATCH", fields, "id=eq.main");
+    var updated = Object.assign({}, timer, fields);
+    setTimer(updated); // instant local update
+    sb(T_TIMER, "PATCH", fields, "id=eq.main"); // fire to DB
   }
 
   function onTimerDone() {
@@ -136,6 +158,7 @@ export default function App() {
 
   function startFocus() {
     var startTime = now12();
+    var serverStart = new Date(serverNow()).toISOString();
     // AUTO-LOG: record session start immediately in timeline
     var logEntry = {
       id: gId(), name: "🎯 جلسة تركيز", description: "بومودورو", category: "work",
@@ -148,21 +171,24 @@ export default function App() {
 
     updateTimer({
       timer_status: "running", session_type: "focus", duration_seconds: focusDur * 60,
-      started_at: new Date().toISOString(), paused_remaining: null,
+      started_at: serverStart, paused_remaining: null,
     });
     setShowReview(false);
   }
 
   function startBreak(type) {
     var dur = type === "long_break" ? longBrk * 60 : shortBrk * 60;
-    updateTimer({ timer_status: "running", session_type: type, duration_seconds: dur, started_at: new Date().toISOString(), paused_remaining: null });
+    var serverStart = new Date(serverNow()).toISOString();
+    updateTimer({ timer_status: "running", session_type: type, duration_seconds: dur, started_at: serverStart, paused_remaining: null });
   }
 
   function onStart() {
     if (timer.timer_status === "idle" || timer.timer_status === "completed") startFocus();
     else if (timer.timer_status === "paused") {
       var rem = timer.paused_remaining || secs;
-      updateTimer({ timer_status: "running", started_at: new Date(Date.now() - (timer.duration_seconds - rem) * 1000).toISOString(), paused_remaining: null });
+      // Calculate started_at based on server time so all devices match
+      var serverStart = new Date(serverNow() - (timer.duration_seconds - rem) * 1000).toISOString();
+      updateTimer({ timer_status: "running", started_at: serverStart, paused_remaining: null });
     }
   }
   function onPause() { updateTimer({ timer_status: "paused", paused_remaining: secs }); }
