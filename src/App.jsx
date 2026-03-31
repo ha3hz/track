@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from "react";
-import { BarChart, Bar, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
+import { BarChart, Bar, PieChart, Pie, Cell, AreaChart, Area, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 
 /* ═══ SUPABASE ═══ */
 const SB_URL = "https://jthfqynavqpzvkgwznzy.supabase.co";
@@ -443,6 +443,87 @@ export default function App() {
               <h2 style={{ fontSize: "1.1rem", fontWeight: 800 }}>📋 السجل الزمني — {selDate}</h2>
               <button className="btn-main" onClick={function() { setShowAdd(true); }}>+ إضافة يدوية</button>
             </div>
+
+            {/* ── Chart 1: Hourly Activity Today ── */}
+            {todayLogs.length > 0 && (function() {
+              var hourly = [];
+              for (var h = 0; h < 24; h++) {
+                var hLabel = (h % 12 || 12) + (h < 12 ? "ص" : "م");
+                var mins = 0;
+                todayLogs.forEach(function(l) {
+                  var s = toMin(l.start_time || "");
+                  var e = toMin(l.end_time || "");
+                  if (e <= s) return;
+                  var sh = Math.floor(s / 60);
+                  var eh = Math.floor(e / 60);
+                  if (h >= sh && h <= eh) {
+                    var fromM = h === sh ? (s % 60) : 0;
+                    var toM = h === eh ? (e % 60) : 60;
+                    mins += toM - fromM;
+                  }
+                });
+                if (mins > 0) hourly.push({ h: hLabel, v: Math.min(mins, 60) });
+              }
+              if (hourly.length === 0) return null;
+              return (
+                <div className="chart-box">
+                  <h3 style={{ fontSize: "0.88rem", fontWeight: 700, marginBottom: 10 }}>⏰ أوقات نشاطك اليوم</h3>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <AreaChart data={hourly}>
+                      <defs>
+                        <linearGradient id="aGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="0%" stopColor="#3b82f6" stopOpacity={0.4} />
+                          <stop offset="100%" stopColor="#3b82f6" stopOpacity={0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                      <XAxis dataKey="h" tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} />
+                      <YAxis tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} domain={[0, 60]} />
+                      <Tooltip contentStyle={{ background: "rgba(10,12,20,0.95)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, direction: "rtl" }} formatter={function(v) { return v + " دقيقة"; }} />
+                      <Area type="monotone" dataKey="v" stroke="#3b82f6" strokeWidth={2} fill="url(#aGrad)" dot={{ fill: "#3b82f6", r: 3 }} />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              );
+            })()}
+
+            {/* ── Chart 2: Daily Activity This Month ── */}
+            {(function() {
+              var now = new Date();
+              var year = now.getFullYear();
+              var month = now.getMonth();
+              var daysInMonth = new Date(year, month + 1, 0).getDate();
+              var monthData = [];
+              for (var d = 1; d <= daysInMonth; d++) {
+                var dateStr = year + "-" + pad(month + 1) + "-" + pad(d);
+                var mins = 0;
+                logs.forEach(function(l) {
+                  if (l.date === dateStr) mins += diffM(l.start_time || "", l.end_time || "");
+                });
+                monthData.push({ d: String(d), v: mins, date: dateStr });
+              }
+              var hasData = monthData.some(function(m) { return m.v > 0; });
+              if (!hasData) return null;
+              return (
+                <div className="chart-box">
+                  <h3 style={{ fontSize: "0.88rem", fontWeight: 700, marginBottom: 10 }}>📅 نشاطك خلال الشهر (دقائق يوميًا)</h3>
+                  <ResponsiveContainer width="100%" height={200}>
+                    <LineChart data={monthData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
+                      <XAxis dataKey="d" tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 9 }} interval={1} />
+                      <YAxis tick={{ fill: "rgba(255,255,255,0.4)", fontSize: 10 }} />
+                      <Tooltip contentStyle={{ background: "rgba(10,12,20,0.95)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, direction: "rtl" }}
+                        formatter={function(v) { return minStr(v); }}
+                        labelFormatter={function(l, payload) { return payload && payload[0] ? payload[0].payload.date : l; }} />
+                      <Line type="monotone" dataKey="v" stroke="#10b981" strokeWidth={2} dot={function(props) {
+                        if (props.payload.v === 0) return null;
+                        return <circle cx={props.cx} cy={props.cy} r={3} fill={props.payload.date === selDate ? "#fbbf24" : "#10b981"} stroke="none" />;
+                      }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              );
+            })()}
 
             {todayLogs.length === 0 && <div className="empty-state">📭 لا توجد أنشطة مسجلة</div>}
 
