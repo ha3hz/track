@@ -513,20 +513,21 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
   }, [liveTimer.timer_status]);
 
   // Update live timer in Supabase — central state
-  async function updateTimer(fields) {
-    const updated = Object.assign({}, fields, { updated_at: new Date().toISOString() });
-    await sbFetch(TBL_TIMER, "PATCH", updated, "id=eq." + TIMER_ID);
+  // Optimistic update: change local state FIRST, then sync to DB in background
+  function updateTimer(fields) {
+    var updated = Object.assign({}, liveTimer, fields, { updated_at: new Date().toISOString() });
+    setLiveTimer(updated); // instant local update
+    sbFetch(TBL_TIMER, "PATCH", fields, "id=eq." + TIMER_ID); // fire-and-forget to DB
   }
 
   function handleTimerEndSync() {
-    // Only trigger once — the first device to detect completion updates the DB
     if (liveTimer.timer_status !== "running") return;
     updateTimer({ timer_status: "completed" });
   }
 
-  async function startFocus() {
-    const dur = settings.focusDuration * 60;
-    await updateTimer({
+  function startFocus() {
+    var dur = settings.focusDuration * 60;
+    updateTimer({
       timer_status: "running", session_type: "focus", duration_seconds: dur,
       started_at: new Date().toISOString(), paused_remaining: null,
       settings_json: JSON.stringify(settings),
@@ -534,21 +535,20 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     setShowReview(false);
   }
 
-  async function startBreak(type) {
-    const dur = type === "long_break" ? settings.longBreak * 60 : settings.shortBreak * 60;
-    await updateTimer({
+  function startBreak(type) {
+    var dur = type === "long_break" ? settings.longBreak * 60 : settings.shortBreak * 60;
+    updateTimer({
       timer_status: "running", session_type: type, duration_seconds: dur,
       started_at: new Date().toISOString(), paused_remaining: null,
     });
   }
 
-  async function handleStart() {
+  function handleStart() {
     if (liveTimer.timer_status === "idle" || liveTimer.timer_status === "completed") {
-      await startFocus();
+      startFocus();
     } else if (liveTimer.timer_status === "paused") {
-      // Resume: set started_at so that remaining matches paused_remaining
-      const remaining = liveTimer.paused_remaining || secondsLeft;
-      await updateTimer({
+      var remaining = liveTimer.paused_remaining || secondsLeft;
+      updateTimer({
         timer_status: "running",
         started_at: new Date(Date.now() - (liveTimer.duration_seconds - remaining) * 1000).toISOString(),
         paused_remaining: null,
@@ -556,20 +556,20 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     }
   }
 
-  async function handlePause() {
-    await updateTimer({ timer_status: "paused", paused_remaining: secondsLeft });
+  function handlePause() {
+    updateTimer({ timer_status: "paused", paused_remaining: secondsLeft });
   }
 
-  async function handleStop() {
-    await updateTimer({
+  function handleStop() {
+    updateTimer({
       timer_status: "idle", session_type: "focus",
       duration_seconds: settings.focusDuration * 60,
       started_at: null, paused_remaining: null,
     });
   }
 
-  async function handleReset() {
-    await updateTimer({
+  function handleReset() {
+    updateTimer({
       timer_status: "idle", session_type: "focus",
       duration_seconds: settings.focusDuration * 60,
       started_at: null, paused_remaining: null,
@@ -577,8 +577,8 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     });
   }
 
-  async function saveReview() {
-    const pomo = {
+  function saveReview() {
+    var pomo = {
       id: genId(), sessionType: "focus", date: selDate,
       startTime: liveTimer.started_at ? fmt12(new Date(liveTimer.started_at).getHours(), new Date(liveTimer.started_at).getMinutes()) : now12(),
       endTime: now12(),
@@ -593,28 +593,21 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     };
 
     setPomos(function(prev) { return prev.concat([pomo]); });
-    await sbFetch(TBL_POMO, "POST", pomoToDb(pomo));
+    sbFetch(TBL_POMO, "POST", pomoToDb(pomo));
 
     // Advance cycle
-    var newSessionInCycle = (liveTimer.session_in_cycle || 1);
-    var newCycleNum = (liveTimer.cycle_number || 1);
-    if (newSessionInCycle >= settings.sessionsBeforeLong) {
-      newSessionInCycle = 1;
-      newCycleNum += 1;
-      if (settings.autoBreak) {
-        await updateTimer({ cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
-        await startBreak("long_break");
-      } else {
-        await updateTimer({ timer_status: "idle", session_type: "long_break", duration_seconds: settings.longBreak * 60, started_at: null, paused_remaining: null, cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
-      }
+    var newSIC = (liveTimer.session_in_cycle || 1);
+    var newCN = (liveTimer.cycle_number || 1);
+    if (newSIC >= settings.sessionsBeforeLong) {
+      newSIC = 1; newCN += 1;
+      updateTimer({ cycle_number: newCN, session_in_cycle: newSIC });
+      if (settings.autoBreak) startBreak("long_break");
+      else updateTimer({ timer_status: "idle", session_type: "long_break", duration_seconds: settings.longBreak * 60, started_at: null, paused_remaining: null });
     } else {
-      newSessionInCycle += 1;
-      if (settings.autoBreak) {
-        await updateTimer({ cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
-        await startBreak("short_break");
-      } else {
-        await updateTimer({ timer_status: "idle", session_type: "short_break", duration_seconds: settings.shortBreak * 60, started_at: null, paused_remaining: null, cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
-      }
+      newSIC += 1;
+      updateTimer({ cycle_number: newCN, session_in_cycle: newSIC });
+      if (settings.autoBreak) startBreak("short_break");
+      else updateTimer({ timer_status: "idle", session_type: "short_break", duration_seconds: settings.shortBreak * 60, started_at: null, paused_remaining: null });
     }
 
     setShowReview(false);
@@ -906,17 +899,32 @@ export default function App() {
   const pomoStats = useMemo(function() { return analyzePomos(pomos, selDate); }, [pomos, selDate]);
   const insights = useMemo(function() { return getInsights(stats, pomoStats); }, [stats, pomoStats]);
 
-  async function handleSave() {
+  function handleSave() {
     if (!editAct || !editAct.name || !editAct.startTime || !editAct.endTime) return;
-    setSaving(true);
-    const exists = acts.find(function(a) { return a.id === editAct.id; });
-    if (exists) { setActs(function(p) { return p.map(function(a) { return a.id === editAct.id ? editAct : a; }); }); await sbFetch(TBL_ACT, "PATCH", toSnake(editAct), "id=eq." + editAct.id); showToastFn("تم التحديث ✅"); }
-    else { setActs(function(p) { return p.concat([editAct]); }); await sbFetch(TBL_ACT, "POST", toSnake(editAct)); showToastFn("تم الإضافة ✅"); }
-    setSaving(false); setSF(false); setEA(null);
+    var exists = acts.find(function(a) { return a.id === editAct.id; });
+    if (exists) {
+      setActs(function(p) { return p.map(function(a) { return a.id === editAct.id ? editAct : a; }); });
+      sbFetch(TBL_ACT, "PATCH", toSnake(editAct), "id=eq." + editAct.id);
+    } else {
+      setActs(function(p) { return p.concat([editAct]); });
+      sbFetch(TBL_ACT, "POST", toSnake(editAct));
+    }
+    showToastFn("تم الحفظ ✅");
+    setSF(false); setEA(null);
   }
 
-  async function handleDelete(id) { setActs(function(p) { return p.filter(function(a) { return a.id !== id; }); }); await sbFetch(TBL_ACT, "DELETE", null, "id=eq." + id); showToastFn("تم الحذف 🗑️", "info"); }
-  async function handleDuplicate(act) { const dup = Object.assign({}, act, { id: genId(), name: act.name + " (نسخة)" }); setActs(function(p) { return p.concat([dup]); }); await sbFetch(TBL_ACT, "POST", toSnake(dup)); showToastFn("تم النسخ 📋"); }
+  function handleDelete(id) {
+    setActs(function(p) { return p.filter(function(a) { return a.id !== id; }); });
+    sbFetch(TBL_ACT, "DELETE", null, "id=eq." + id);
+    showToastFn("تم الحذف 🗑️", "info");
+  }
+
+  function handleDuplicate(act) {
+    var dup = Object.assign({}, act, { id: genId(), name: act.name + " (نسخة)" });
+    setActs(function(p) { return p.concat([dup]); });
+    sbFetch(TBL_ACT, "POST", toSnake(dup));
+    showToastFn("تم النسخ 📋");
+  }
 
   const NAV = [
     { id: "dash", l: "لوحة التحكم", i: "📊" },
