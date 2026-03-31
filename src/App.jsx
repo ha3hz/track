@@ -107,32 +107,96 @@ function pomoFromDb(r) {
   };
 }
 
-/* ═══ REALTIME ═══ */
+/* ═══ REALTIME with POLLING FALLBACK ═══ */
 class RTChannel {
   constructor(url, key, table, cb) {
     this.wsUrl = url.replace("https://", "wss://") + "/realtime/v1/websocket?apikey=" + key + "&vsn=1.0.0";
-    this.table = table; this.cb = cb; this.ws = null; this.hb = null; this.ref = 0;
+    this.table = table;
+    this.cb = cb;
+    this.ws = null;
+    this.hb = null;
+    this.ref = 0;
+    this.joined = false;
   }
   connect() {
     try {
       this.ws = new WebSocket(this.wsUrl);
       this.ws.onopen = () => {
-        this.send({ topic: "realtime:public:" + this.table, event: "phx_join",
-          payload: { config: { postgres_changes: [{ event: "*", schema: "public", table: this.table }] } },
-          ref: String(++this.ref) });
+        // Join the channel
+        this.ref++;
+        this.send({
+          topic: "realtime:public:" + this.table,
+          event: "phx_join",
+          payload: {
+            config: {
+              broadcast: { self: false },
+              postgres_changes: [
+                { event: "*", schema: "public", table: this.table }
+              ]
+            }
+          },
+          ref: String(this.ref)
+        });
         this.hb = setInterval(() => {
-          this.send({ topic: "phoenix", event: "heartbeat", payload: {}, ref: String(++this.ref) });
-        }, 30000);
+          this.ref++;
+          this.send({ topic: "phoenix", event: "heartbeat", payload: {}, ref: String(this.ref) });
+        }, 29000);
       };
       this.ws.onmessage = (ev) => {
-        try { const msg = JSON.parse(ev.data); if (msg.event === "postgres_changes") this.cb(msg.payload); } catch (e) {}
+        try {
+          var msg = JSON.parse(ev.data);
+          // Handle phx_reply to confirm join
+          if (msg.event === "phx_reply" && msg.payload && msg.payload.status === "ok") {
+            this.joined = true;
+          }
+          // Handle postgres_changes events
+          if (msg.event === "postgres_changes" && msg.payload) {
+            this.cb(msg.payload);
+          }
+          // Also handle system broadcast events
+          if (msg.event === "system" && msg.payload) {
+            // ignore system messages
+          }
+        } catch (e) { /* parse error */ }
       };
-      this.ws.onclose = () => { clearInterval(this.hb); setTimeout(() => this.connect(), 3000); };
-      this.ws.onerror = () => { if (this.ws) this.ws.close(); };
-    } catch (e) { setTimeout(() => this.connect(), 5000); }
+      this.ws.onclose = () => {
+        this.joined = false;
+        clearInterval(this.hb);
+        setTimeout(() => this.connect(), 2000);
+      };
+      this.ws.onerror = () => {
+        if (this.ws) this.ws.close();
+      };
+    } catch (e) {
+      setTimeout(() => this.connect(), 3000);
+    }
   }
-  send(msg) { try { if (this.ws && this.ws.readyState === 1) this.ws.send(JSON.stringify(msg)); } catch (e) {} }
-  disconnect() { clearInterval(this.hb); if (this.ws) this.ws.close(); }
+  send(msg) {
+    try {
+      if (this.ws && this.ws.readyState === 1) {
+        this.ws.send(JSON.stringify(msg));
+      }
+    } catch (e) { /* send error */ }
+  }
+  disconnect() {
+    this.joined = false;
+    clearInterval(this.hb);
+    if (this.ws) this.ws.close();
+  }
+}
+
+// Polling helper for guaranteed sync when Realtime is slow
+function usePollSync(table, interval, mapper, setter) {
+  useEffect(function() {
+    var id = setInterval(function() {
+      sbFetch(table, "GET", null, "order=created_at.desc&limit=500").then(function(rows) {
+        if (rows && Array.isArray(rows)) {
+          setter(rows.map(mapper));
+        }
+      });
+    }, interval);
+    return function() { clearInterval(id); };
+  }, []);
 }
 
 /* ═══ CONSTANTS ═══ */
@@ -450,11 +514,11 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
   // Load live timer state from Supabase
   useEffect(function() {
     async function loadTimer() {
-      const rows = await sbFetch(TBL_TIMER, "GET", null, "id=eq." + TIMER_ID);
+      var rows = await sbFetch(TBL_TIMER, "GET", null, "id=eq." + TIMER_ID);
       if (rows && rows.length > 0) {
         setLiveTimer(rows[0]);
         if (rows[0].settings_json) {
-          try { const s = JSON.parse(rows[0].settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
+          try { var s = JSON.parse(rows[0].settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
         }
       }
     }
@@ -463,18 +527,40 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
 
   // Realtime subscription for live timer
   useEffect(function() {
-    const ch = new RTChannel(SB_URL, SB_KEY, TBL_TIMER, function(payload) {
-      const data = payload.data || payload;
-      const nr = data.new;
+    var ch = new RTChannel(SB_URL, SB_KEY, TBL_TIMER, function(payload) {
+      var data = payload.data || payload;
+      var nr = data.new;
       if (nr && nr.id === TIMER_ID) {
         setLiveTimer(nr);
         if (nr.settings_json) {
-          try { const s = JSON.parse(nr.settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
+          try { var s = JSON.parse(nr.settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
         }
       }
     });
     ch.connect();
     return function() { ch.disconnect(); };
+  }, []);
+
+  // POLLING FALLBACK: re-fetch timer state every 3 seconds to guarantee sync
+  useEffect(function() {
+    var pollId = setInterval(function() {
+      sbFetch(TBL_TIMER, "GET", null, "id=eq." + TIMER_ID).then(function(rows) {
+        if (rows && rows.length > 0) {
+          setLiveTimer(function(prev) {
+            // Only update if actually changed (prevent unnecessary rerenders)
+            if (prev.timer_status !== rows[0].timer_status ||
+                prev.started_at !== rows[0].started_at ||
+                prev.paused_remaining !== rows[0].paused_remaining ||
+                prev.session_type !== rows[0].session_type ||
+                prev.cycle_number !== rows[0].cycle_number) {
+              return rows[0];
+            }
+            return prev;
+          });
+        }
+      });
+    }, 3000);
+    return function() { clearInterval(pollId); };
   }, []);
 
   // Calculate seconds left from server time — runs every 200ms for precision
@@ -869,8 +955,8 @@ export default function App() {
 
   // Realtime for activities
   useEffect(function() {
-    const ch = new RTChannel(SB_URL, SB_KEY, TBL_ACT, function(payload) {
-      const data = payload.data || payload; const et = data.eventType; const nr = data.new; const or = data.old;
+    var ch = new RTChannel(SB_URL, SB_KEY, TBL_ACT, function(payload) {
+      var data = payload.data || payload; var et = data.eventType; var nr = data.new; var or = data.old;
       if (et === "INSERT" && nr) setActs(function(p) { if (p.find(function(a) { return a.id === nr.id; })) return p; return p.concat([toCamel(nr)]); });
       else if (et === "UPDATE" && nr) setActs(function(p) { return p.map(function(a) { return a.id === nr.id ? toCamel(nr) : a; }); });
       else if (et === "DELETE" && or) setActs(function(p) { return p.filter(function(a) { return a.id !== or.id; }); });
@@ -881,13 +967,26 @@ export default function App() {
 
   // Realtime for pomodoro
   useEffect(function() {
-    const ch = new RTChannel(SB_URL, SB_KEY, TBL_POMO, function(payload) {
-      const data = payload.data || payload; const et = data.eventType; const nr = data.new; const or = data.old;
+    var ch = new RTChannel(SB_URL, SB_KEY, TBL_POMO, function(payload) {
+      var data = payload.data || payload; var et = data.eventType; var nr = data.new; var or = data.old;
       if (et === "INSERT" && nr) setPomos(function(p) { if (p.find(function(x) { return x.id === nr.id; })) return p; return p.concat([pomoFromDb(nr)]); });
       else if (et === "UPDATE" && nr) setPomos(function(p) { return p.map(function(x) { return x.id === nr.id ? pomoFromDb(nr) : x; }); });
       else if (et === "DELETE" && or) setPomos(function(p) { return p.filter(function(x) { return x.id !== or.id; }); });
     });
     ch.connect(); return function() { ch.disconnect(); };
+  }, []);
+
+  // POLLING FALLBACK: re-fetch activities and pomos every 10 seconds
+  useEffect(function() {
+    var pollId = setInterval(function() {
+      sbFetch(TBL_ACT, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(rows) {
+        if (rows && Array.isArray(rows)) setActs(rows.map(toCamel));
+      });
+      sbFetch(TBL_POMO, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(rows) {
+        if (rows && Array.isArray(rows)) setPomos(rows.map(pomoFromDb));
+      });
+    }, 10000);
+    return function() { clearInterval(pollId); };
   }, []);
 
   // Backup
