@@ -421,16 +421,20 @@ function Modal({ open, onClose, title, children }) {
    POMODORO TIMER COMPONENT
    ═══════════════════════════════════════════════════ */
 function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
+  const TBL_TIMER = "perf_live_timer";
+  const TIMER_ID = "main";
+
   const [settings, setSettings] = useState({
     focusDuration: 25, shortBreak: 5, longBreak: 15,
     sessionsBeforeLong: 4, autoBreak: true, autoNext: false, sound: true,
   });
-  const [timerState, setTimerState] = useState("idle"); // idle, running, paused, completed
-  const [sessionType, setSessionType] = useState("focus"); // focus, short_break, long_break
-  const [secondsLeft, setSecondsLeft] = useState(25 * 60);
-  const [cycleNum, setCycleNum] = useState(1);
-  const [sessionInCycle, setSessionInCycle] = useState(1);
-  const [sessionStartTime, setSessionStartTime] = useState("");
+
+  // Live timer state from DB — single source of truth
+  const [liveTimer, setLiveTimer] = useState({
+    timer_status: "idle", session_type: "focus", duration_seconds: 1500,
+    started_at: null, paused_remaining: null, cycle_number: 1, session_in_cycle: 1,
+  });
+  const [secondsLeft, setSecondsLeft] = useState(1500);
   const [showReview, setShowReview] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [review, setReview] = useState({
@@ -440,122 +444,144 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     linkedActivityId: "",
   });
 
-  const intervalRef = useRef(null);
-  const totalSeconds = sessionType === "focus" ? settings.focusDuration * 60 :
-    sessionType === "short_break" ? settings.shortBreak * 60 : settings.longBreak * 60;
+  const tickRef = useRef(null);
+  const timerColor = POMO_COLORS[liveTimer.session_type] || "#ef4444";
 
-  const progress = totalSeconds > 0 ? ((totalSeconds - secondsLeft) / totalSeconds) * 100 : 0;
-  const minutes = Math.floor(secondsLeft / 60);
-  const seconds = secondsLeft % 60;
-  const timerColor = POMO_COLORS[sessionType] || "#ef4444";
-
-  // Timer tick
+  // Load live timer state from Supabase
   useEffect(function() {
-    if (timerState === "running") {
-      intervalRef.current = setInterval(function() {
-        setSecondsLeft(function(prev) {
-          if (prev <= 1) {
-            clearInterval(intervalRef.current);
-            handleTimerEnd();
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-    } else {
-      clearInterval(intervalRef.current);
-    }
-    return function() { clearInterval(intervalRef.current); };
-  }, [timerState]);
-
-  // Save timer state to localStorage for recovery
-  useEffect(function() {
-    if (timerState === "running" || timerState === "paused") {
-      localStorage.setItem("pomo_state", JSON.stringify({
-        timerState, sessionType, secondsLeft, cycleNum, sessionInCycle, sessionStartTime, settings
-      }));
-    }
-  }, [timerState, secondsLeft]);
-
-  // Restore timer state on mount
-  useEffect(function() {
-    try {
-      const saved = localStorage.getItem("pomo_state");
-      if (saved) {
-        const s = JSON.parse(saved);
-        if (s.timerState === "running" || s.timerState === "paused") {
-          setTimerState("paused");
-          setSessionType(s.sessionType);
-          setSecondsLeft(s.secondsLeft);
-          setCycleNum(s.cycleNum);
-          setSessionInCycle(s.sessionInCycle);
-          setSessionStartTime(s.sessionStartTime);
-          if (s.settings) setSettings(s.settings);
+    async function loadTimer() {
+      const rows = await sbFetch(TBL_TIMER, "GET", null, "id=eq." + TIMER_ID);
+      if (rows && rows.length > 0) {
+        setLiveTimer(rows[0]);
+        if (rows[0].settings_json) {
+          try { const s = JSON.parse(rows[0].settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
         }
       }
-    } catch (e) {}
+    }
+    loadTimer();
   }, []);
 
-  function handleTimerEnd() {
-    setTimerState("completed");
-    localStorage.removeItem("pomo_state");
-    if (settings.sound) {
-      try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); const osc = ctx.createOscillator(); osc.connect(ctx.destination); osc.frequency.value = 800; osc.start(); setTimeout(function() { osc.stop(); }, 300); } catch (e) {}
-    }
-    if (sessionType === "focus") {
-      setShowReview(true);
-    } else {
-      // Break ended
-      if (settings.autoNext) {
-        startFocus();
+  // Realtime subscription for live timer
+  useEffect(function() {
+    const ch = new RTChannel(SB_URL, SB_KEY, TBL_TIMER, function(payload) {
+      const data = payload.data || payload;
+      const nr = data.new;
+      if (nr && nr.id === TIMER_ID) {
+        setLiveTimer(nr);
+        if (nr.settings_json) {
+          try { const s = JSON.parse(nr.settings_json); if (s.focusDuration) setSettings(s); } catch (e) {}
+        }
+      }
+    });
+    ch.connect();
+    return function() { ch.disconnect(); };
+  }, []);
+
+  // Calculate seconds left from server time — runs every 200ms for precision
+  useEffect(function() {
+    function calcSeconds() {
+      if (liveTimer.timer_status === "running" && liveTimer.started_at) {
+        const startedMs = new Date(liveTimer.started_at).getTime();
+        const nowMs = Date.now();
+        const elapsed = Math.floor((nowMs - startedMs) / 1000);
+        const remaining = Math.max(0, liveTimer.duration_seconds - elapsed);
+        setSecondsLeft(remaining);
+        if (remaining <= 0) {
+          handleTimerEndSync();
+        }
+      } else if (liveTimer.timer_status === "paused" && liveTimer.paused_remaining !== null) {
+        setSecondsLeft(liveTimer.paused_remaining);
+      } else if (liveTimer.timer_status === "idle") {
+        setSecondsLeft(liveTimer.duration_seconds || settings.focusDuration * 60);
+      } else if (liveTimer.timer_status === "completed") {
+        setSecondsLeft(0);
       }
     }
+    calcSeconds();
+    tickRef.current = setInterval(calcSeconds, 200);
+    return function() { clearInterval(tickRef.current); };
+  }, [liveTimer]);
+
+  // Show review when status changes to completed and type is focus
+  useEffect(function() {
+    if (liveTimer.timer_status === "completed" && liveTimer.session_type === "focus") {
+      setShowReview(true);
+      if (settings.sound) {
+        try { const ctx = new (window.AudioContext || window.webkitAudioContext)(); const osc = ctx.createOscillator(); osc.connect(ctx.destination); osc.frequency.value = 800; osc.start(); setTimeout(function() { osc.stop(); }, 300); } catch (e) {}
+      }
+    }
+  }, [liveTimer.timer_status]);
+
+  // Update live timer in Supabase — central state
+  async function updateTimer(fields) {
+    const updated = Object.assign({}, fields, { updated_at: new Date().toISOString() });
+    await sbFetch(TBL_TIMER, "PATCH", updated, "id=eq." + TIMER_ID);
   }
 
-  function startFocus() {
-    setSessionType("focus");
-    setSecondsLeft(settings.focusDuration * 60);
-    setTimerState("running");
-    setSessionStartTime(now12());
+  function handleTimerEndSync() {
+    // Only trigger once — the first device to detect completion updates the DB
+    if (liveTimer.timer_status !== "running") return;
+    updateTimer({ timer_status: "completed" });
+  }
+
+  async function startFocus() {
+    const dur = settings.focusDuration * 60;
+    await updateTimer({
+      timer_status: "running", session_type: "focus", duration_seconds: dur,
+      started_at: new Date().toISOString(), paused_remaining: null,
+      settings_json: JSON.stringify(settings),
+    });
     setShowReview(false);
   }
 
-  function startBreak(type) {
-    const dur = type === "long_break" ? settings.longBreak : settings.shortBreak;
-    setSessionType(type);
-    setSecondsLeft(dur * 60);
-    setTimerState("running");
-    setSessionStartTime(now12());
+  async function startBreak(type) {
+    const dur = type === "long_break" ? settings.longBreak * 60 : settings.shortBreak * 60;
+    await updateTimer({
+      timer_status: "running", session_type: type, duration_seconds: dur,
+      started_at: new Date().toISOString(), paused_remaining: null,
+    });
   }
 
-  function handleStart() {
-    if (timerState === "idle" || timerState === "completed") {
-      startFocus();
-    } else if (timerState === "paused") {
-      setTimerState("running");
+  async function handleStart() {
+    if (liveTimer.timer_status === "idle" || liveTimer.timer_status === "completed") {
+      await startFocus();
+    } else if (liveTimer.timer_status === "paused") {
+      // Resume: set started_at so that remaining matches paused_remaining
+      const remaining = liveTimer.paused_remaining || secondsLeft;
+      await updateTimer({
+        timer_status: "running",
+        started_at: new Date(Date.now() - (liveTimer.duration_seconds - remaining) * 1000).toISOString(),
+        paused_remaining: null,
+      });
     }
   }
 
-  function handlePause() { setTimerState("paused"); }
-  function handleResume() { setTimerState("running"); }
-
-  function handleStop() {
-    setTimerState("idle");
-    setSecondsLeft(settings.focusDuration * 60);
-    setSessionType("focus");
-    localStorage.removeItem("pomo_state");
+  async function handlePause() {
+    await updateTimer({ timer_status: "paused", paused_remaining: secondsLeft });
   }
 
-  function handleReset() {
-    handleStop();
-    setCycleNum(1);
-    setSessionInCycle(1);
+  async function handleStop() {
+    await updateTimer({
+      timer_status: "idle", session_type: "focus",
+      duration_seconds: settings.focusDuration * 60,
+      started_at: null, paused_remaining: null,
+    });
+  }
+
+  async function handleReset() {
+    await updateTimer({
+      timer_status: "idle", session_type: "focus",
+      duration_seconds: settings.focusDuration * 60,
+      started_at: null, paused_remaining: null,
+      cycle_number: 1, session_in_cycle: 1,
+    });
   }
 
   async function saveReview() {
     const pomo = {
       id: genId(), sessionType: "focus", date: selDate,
-      startTime: sessionStartTime, endTime: now12(),
+      startTime: liveTimer.started_at ? fmt12(new Date(liveTimer.started_at).getHours(), new Date(liveTimer.started_at).getMinutes()) : now12(),
+      endTime: now12(),
       duration: settings.focusDuration, completed: true,
       linkedActivityId: review.linkedActivityId,
       accomplishment: review.accomplishment, notAccomplished: review.notAccomplished,
@@ -563,21 +589,32 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
       distractionReason: review.distractionReason, focusLevel: review.focusLevel,
       energyLevel: review.energyLevel, wasDeep: review.wasDeep,
       rating: review.rating, notes: review.notes,
-      cycleNumber: cycleNum, sessionInCycle: sessionInCycle,
+      cycleNumber: liveTimer.cycle_number || 1, sessionInCycle: liveTimer.session_in_cycle || 1,
     };
 
-    // Optimistic update
     setPomos(function(prev) { return prev.concat([pomo]); });
     await sbFetch(TBL_POMO, "POST", pomoToDb(pomo));
 
     // Advance cycle
-    if (sessionInCycle >= settings.sessionsBeforeLong) {
-      setSessionInCycle(1);
-      setCycleNum(function(c) { return c + 1; });
-      if (settings.autoBreak) { startBreak("long_break"); } else { setTimerState("idle"); setSecondsLeft(settings.longBreak * 60); setSessionType("long_break"); }
+    var newSessionInCycle = (liveTimer.session_in_cycle || 1);
+    var newCycleNum = (liveTimer.cycle_number || 1);
+    if (newSessionInCycle >= settings.sessionsBeforeLong) {
+      newSessionInCycle = 1;
+      newCycleNum += 1;
+      if (settings.autoBreak) {
+        await updateTimer({ cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
+        await startBreak("long_break");
+      } else {
+        await updateTimer({ timer_status: "idle", session_type: "long_break", duration_seconds: settings.longBreak * 60, started_at: null, paused_remaining: null, cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
+      }
     } else {
-      setSessionInCycle(function(s) { return s + 1; });
-      if (settings.autoBreak) { startBreak("short_break"); } else { setTimerState("idle"); setSecondsLeft(settings.shortBreak * 60); setSessionType("short_break"); }
+      newSessionInCycle += 1;
+      if (settings.autoBreak) {
+        await updateTimer({ cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
+        await startBreak("short_break");
+      } else {
+        await updateTimer({ timer_status: "idle", session_type: "short_break", duration_seconds: settings.shortBreak * 60, started_at: null, paused_remaining: null, cycle_number: newCycleNum, session_in_cycle: newSessionInCycle });
+      }
     }
 
     setShowReview(false);
@@ -586,12 +623,10 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
   }
 
   function skipReview() {
-    // Save incomplete session
     const pomo = {
       id: genId(), sessionType: "focus", date: selDate,
-      startTime: sessionStartTime, endTime: now12(),
-      duration: settings.focusDuration, completed: true,
-      cycleNumber: cycleNum, sessionInCycle: sessionInCycle,
+      startTime: now12(), endTime: now12(), duration: settings.focusDuration, completed: true,
+      cycleNumber: liveTimer.cycle_number || 1, sessionInCycle: liveTimer.session_in_cycle || 1,
       linkedActivityId: "", accomplishment: "", notAccomplished: "",
       wasUseful: true, wasDistracted: false, distractionReason: "",
       focusLevel: "متوسط", energyLevel: "متوسطة", wasDeep: false, rating: 3, notes: "",
@@ -599,70 +634,77 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
     setPomos(function(prev) { return prev.concat([pomo]); });
     sbFetch(TBL_POMO, "POST", pomoToDb(pomo));
     setShowReview(false);
-    if (settings.autoBreak) {
-      if (sessionInCycle >= settings.sessionsBeforeLong) { startBreak("long_break"); setSessionInCycle(1); setCycleNum(function(c) { return c + 1; }); }
-      else { startBreak("short_break"); setSessionInCycle(function(s) { return s + 1; }); }
-    } else { setTimerState("idle"); }
+    handleStop();
     showToast("تم حفظ الجلسة ✅");
   }
 
-  // Today's pomo stats
-  const todayPomos = pomos.filter(function(p) { return p.date === selDate; });
-  const todayFocus = todayPomos.filter(function(p) { return p.sessionType === "focus"; });
-  const todayCompleted = todayFocus.filter(function(p) { return p.completed; });
-  const todayFocusMin = todayFocus.reduce(function(s, p) { return s + (p.duration || 0); }, 0);
+  // Today's stats
+  var todayPomos = pomos.filter(function(p) { return p.date === selDate; });
+  var todayFocus = todayPomos.filter(function(p) { return p.sessionType === "focus"; });
+  var todayCompleted = todayFocus.filter(function(p) { return p.completed; });
+  var todayFocusMin = todayFocus.reduce(function(s, p) { return s + (p.duration || 0); }, 0);
 
-  // Timer ring
-  const ringSize = 260; const ringR = (ringSize - 20) / 2; const ringC = 2 * Math.PI * ringR;
+  var totalSeconds = liveTimer.duration_seconds || settings.focusDuration * 60;
+  var progress = totalSeconds > 0 ? ((totalSeconds - secondsLeft) / totalSeconds) * 100 : 0;
+  var minutes = Math.floor(secondsLeft / 60);
+  var seconds = secondsLeft % 60;
+  var ringSize = 260;
+  var ringR = (ringSize - 20) / 2;
+  var ringC = 2 * Math.PI * ringR;
+  var status = liveTimer.timer_status;
 
   return (
     <div className="anim-in">
+      {/* Live status indicator */}
+      {status === "running" && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "10px 20px", background: timerColor + "15", borderRadius: 14, border: "1px solid " + timerColor + "30", marginBottom: 16, fontSize: "0.85rem" }}>
+          <div style={{ width: 8, height: 8, borderRadius: "50%", background: timerColor, animation: "pulse 1s infinite" }} />
+          <span style={{ color: timerColor, fontWeight: 700 }}>{POMO_LABELS[liveTimer.session_type] || "جلسة"} شغالة الآن — متزامنة لجميع الأجهزة</span>
+        </div>
+      )}
+
       <div className="pomo-main">
-        {/* Timer Display */}
         <div className="pomo-timer-zone">
           <div style={{ position: "relative", width: ringSize, height: ringSize }}>
             <svg width={ringSize} height={ringSize} style={{ transform: "rotate(-90deg)" }}>
               <circle cx={ringSize / 2} cy={ringSize / 2} r={ringR} fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="8" />
               <circle cx={ringSize / 2} cy={ringSize / 2} r={ringR} fill="none" stroke={timerColor} strokeWidth="8"
                 strokeDasharray={ringC} strokeDashoffset={ringC - (progress / 100) * ringC} strokeLinecap="round"
-                style={{ transition: "stroke-dashoffset 0.5s linear", filter: "drop-shadow(0 0 12px " + timerColor + "50)" }} />
+                style={{ transition: "stroke-dashoffset 0.3s linear", filter: "drop-shadow(0 0 12px " + timerColor + "50)" }} />
             </svg>
             <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
               <div style={{ fontSize: "3.5rem", fontWeight: 900, fontFamily: "monospace", color: timerColor, lineHeight: 1, letterSpacing: "0.05em" }}>
                 {padZ(minutes)}:{padZ(seconds)}
               </div>
               <div style={{ fontSize: "0.8rem", color: "rgba(255,255,255,0.5)", marginTop: 8 }}>
-                {POMO_LABELS[sessionType]}
+                {POMO_LABELS[liveTimer.session_type]}
               </div>
               <div style={{ fontSize: "0.7rem", color: "rgba(255,255,255,0.3)", marginTop: 4 }}>
-                الدورة {cycleNum} • الجلسة {sessionInCycle}/{settings.sessionsBeforeLong}
+                الدورة {liveTimer.cycle_number || 1} • الجلسة {liveTimer.session_in_cycle || 1}/{settings.sessionsBeforeLong}
               </div>
+              {status === "paused" && <div style={{ fontSize: "0.75rem", color: "#fbbf24", marginTop: 6, fontWeight: 700 }}>⏸ متوقف مؤقتًا</div>}
             </div>
           </div>
 
-          {/* Controls */}
           <div style={{ display: "flex", gap: 10, marginTop: 20, flexWrap: "wrap", justifyContent: "center" }}>
-            {timerState === "idle" && <button className="btn-prime" onClick={handleStart}>▶ ابدأ التركيز</button>}
-            {timerState === "running" && <button className="btn-ghost" onClick={handlePause}>⏸ إيقاف مؤقت</button>}
-            {timerState === "paused" && <button className="btn-prime" onClick={handleResume}>▶ استئناف</button>}
-            {timerState === "paused" && <button className="btn-ghost" style={{ borderColor: "#ef4444", color: "#ef4444" }} onClick={handleStop}>⏹ إنهاء</button>}
-            {timerState === "completed" && sessionType !== "focus" && <button className="btn-prime" onClick={startFocus}>▶ جلسة جديدة</button>}
-            <button className="btn-ghost" onClick={function() { setShowSettings(!showSettings); }} style={{ fontSize: "0.8rem" }}>⚙️ إعدادات</button>
-            {(timerState !== "idle") && <button className="btn-ghost" onClick={handleReset} style={{ fontSize: "0.8rem" }}>🔄 إعادة ضبط</button>}
+            {status === "idle" && <button className="btn-prime" onClick={handleStart}>▶ ابدأ التركيز</button>}
+            {status === "running" && <button className="btn-ghost" onClick={handlePause}>⏸ إيقاف مؤقت</button>}
+            {status === "paused" && <button className="btn-prime" onClick={handleStart}>▶ استئناف</button>}
+            {status === "paused" && <button className="btn-ghost" style={{ borderColor: "#ef4444", color: "#ef4444" }} onClick={handleStop}>⏹ إنهاء</button>}
+            {status === "completed" && liveTimer.session_type !== "focus" && <button className="btn-prime" onClick={startFocus}>▶ جلسة جديدة</button>}
+            <button className="btn-ghost" onClick={function() { setShowSettings(!showSettings); }} style={{ fontSize: "0.8rem" }}>⚙️</button>
+            {status !== "idle" && <button className="btn-ghost" onClick={handleReset} style={{ fontSize: "0.8rem" }}>🔄</button>}
           </div>
         </div>
 
-        {/* Today's Stats */}
         <div className="pomo-stats">
           <h3 className="panel-t">📊 إحصائيات اليوم</h3>
           <div className="pomo-stats-grid">
-            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#00e5a0" }}>{todayCompleted.length}</span><span className="pomo-stat-l">جلسات مكتملة</span></div>
-            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#00d4ff" }}>{todayFocus.length}</span><span className="pomo-stat-l">إجمالي الجلسات</span></div>
+            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#00e5a0" }}>{todayCompleted.length}</span><span className="pomo-stat-l">مكتملة</span></div>
+            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#00d4ff" }}>{todayFocus.length}</span><span className="pomo-stat-l">إجمالي</span></div>
             <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#fbbf24" }}>{mStr(todayFocusMin)}</span><span className="pomo-stat-l">وقت التركيز</span></div>
-            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#a78bfa" }}>{todayFocus.filter(function(p) { return p.wasDeep; }).length}</span><span className="pomo-stat-l">جلسات عميقة</span></div>
+            <div className="pomo-stat"><span className="pomo-stat-v" style={{ color: "#a78bfa" }}>{todayFocus.filter(function(p) { return p.wasDeep; }).length}</span><span className="pomo-stat-l">عميقة</span></div>
           </div>
-
-          {/* Session Log */}
           {todayPomos.length > 0 && (
             <div style={{ marginTop: 16 }}>
               <h4 style={{ fontSize: "0.85rem", fontWeight: 600, marginBottom: 8 }}>📋 سجل الجلسات</h4>
@@ -682,14 +724,13 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
         </div>
       </div>
 
-      {/* Settings Panel */}
       {showSettings && (
         <div className="glass-panel" style={{ marginTop: 16 }}>
           <h3 className="panel-t">⚙️ إعدادات البومودورو</h3>
           <div className="fgrid">
-            <div><label className="fl">مدة التركيز (دقيقة)</label><input type="number" className="fi" value={settings.focusDuration} onChange={function(e) { const v = parseInt(e.target.value) || 25; setSettings(function(s) { return Object.assign({}, s, { focusDuration: v }); }); setSecondsLeft(v * 60); }} /></div>
-            <div><label className="fl">بريك قصير (دقيقة)</label><input type="number" className="fi" value={settings.shortBreak} onChange={function(e) { setSettings(function(s) { return Object.assign({}, s, { shortBreak: parseInt(e.target.value) || 5 }); }); }} /></div>
-            <div><label className="fl">بريك طويل (دقيقة)</label><input type="number" className="fi" value={settings.longBreak} onChange={function(e) { setSettings(function(s) { return Object.assign({}, s, { longBreak: parseInt(e.target.value) || 15 }); }); }} /></div>
+            <div><label className="fl">مدة التركيز (د)</label><input type="number" className="fi" value={settings.focusDuration} onChange={function(e) { var v = parseInt(e.target.value) || 25; setSettings(function(s) { return Object.assign({}, s, { focusDuration: v }); }); if (status === "idle") updateTimer({ duration_seconds: v * 60, settings_json: JSON.stringify(Object.assign({}, settings, { focusDuration: v })) }); }} /></div>
+            <div><label className="fl">بريك قصير (د)</label><input type="number" className="fi" value={settings.shortBreak} onChange={function(e) { setSettings(function(s) { return Object.assign({}, s, { shortBreak: parseInt(e.target.value) || 5 }); }); }} /></div>
+            <div><label className="fl">بريك طويل (د)</label><input type="number" className="fi" value={settings.longBreak} onChange={function(e) { setSettings(function(s) { return Object.assign({}, s, { longBreak: parseInt(e.target.value) || 15 }); }); }} /></div>
             <div><label className="fl">جلسات قبل البريك الطويل</label><input type="number" className="fi" value={settings.sessionsBeforeLong} onChange={function(e) { setSettings(function(s) { return Object.assign({}, s, { sessionsBeforeLong: parseInt(e.target.value) || 4 }); }); }} /></div>
             <div><Toggle checked={settings.autoBreak} onChange={function(v) { setSettings(function(s) { return Object.assign({}, s, { autoBreak: v }); }); }} label="بريك تلقائي" /></div>
             <div><Toggle checked={settings.autoNext} onChange={function(v) { setSettings(function(s) { return Object.assign({}, s, { autoNext: v }); }); }} label="جلسة تالية تلقائية" /></div>
@@ -698,7 +739,6 @@ function PomodoroTimer({ pomos, setPomos, acts, showToast, selDate }) {
         </div>
       )}
 
-      {/* Review Modal */}
       <Modal open={showReview} onClose={function() {}} title="🎯 تقييم الجلسة">
         <div className="form-s">
           <div className="fsec">
