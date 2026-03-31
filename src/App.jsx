@@ -76,65 +76,74 @@ export default function App() {
   // ─── CLOCK ───
   useEffect(function() { var t = setInterval(function() { setClock(now12()); }, 1000); return function() { clearInterval(t); }; }, []);
 
-  // ─── SERVER TIME OFFSET ───
-  // Calculate difference between local clock and server clock
-  var serverOffsetRef = useRef(0);
-  useEffect(function() {
-    var before = Date.now();
-    sb(T_TIMER, "GET", null, "id=eq.main&select=updated_at").then(function(r) {
-      if (r && r.length > 0 && r[0].updated_at) {
-        var after = Date.now();
-        var roundTrip = after - before;
-        var serverTime = new Date(r[0].updated_at).getTime() + roundTrip / 2;
-        serverOffsetRef.current = serverTime - after;
-      }
-    });
-  }, []);
-
-  function serverNow() {
-    return Date.now() + serverOffsetRef.current;
+  // ─── HELPER: Get timer state from server (server calculates seconds_remaining) ───
+  function fetchTimerState() {
+    return fetch(SB_URL + "/rest/v1/rpc/get_timer_state", {
+      method: "POST",
+      headers: Object.assign({}, SB_H),
+      body: "{}",
+    }).then(function(r) { return r.ok ? r.json() : null; }).catch(function() { return null; });
   }
 
-  // ─── POLLING SYNC (every 1s for timer to keep all devices in sync) ───
+  // ─── POLL TIMER STATE FROM SERVER every 1 second ───
+  // The server calculates seconds_remaining using NOW() - started_at
+  // This means ALL devices get the EXACT same number — no local clock differences
   useEffect(function() {
-    var t1 = setInterval(function() {
-      sb(T_TIMER, "GET", null, "id=eq.main").then(function(r) {
-        if (r && r.length > 0) setTimer(function(prev) {
-          var n = r[0];
-          if (prev.timer_status !== n.timer_status || prev.started_at !== n.started_at || prev.paused_remaining !== n.paused_remaining || prev.session_type !== n.session_type || prev.cycle_number !== n.cycle_number || prev.session_in_cycle !== n.session_in_cycle) return n;
-          return prev;
-        });
+    // Initial fetch
+    fetchTimerState().then(function(rows) {
+      if (rows && rows.length > 0) {
+        setTimer(rows[0]);
+        setSecs(rows[0].seconds_remaining);
+      }
+    });
+
+    // Poll every 1 second
+    var pollId = setInterval(function() {
+      fetchTimerState().then(function(rows) {
+        if (rows && rows.length > 0) {
+          var s = rows[0];
+          setTimer(function(prev) {
+            // Always update seconds_remaining
+            // Only update other fields if they changed
+            if (prev.timer_status !== s.timer_status ||
+                prev.started_at !== s.started_at ||
+                prev.paused_remaining !== s.paused_remaining ||
+                prev.session_type !== s.session_type ||
+                prev.cycle_number !== s.cycle_number ||
+                prev.session_in_cycle !== s.session_in_cycle) {
+              return s;
+            }
+            return prev;
+          });
+          setSecs(s.seconds_remaining);
+          // Check if timer just completed
+          if (s.timer_status === "running" && s.seconds_remaining <= 0) {
+            onTimerDone();
+          }
+        }
       });
-    }, 1500);
-    var t2 = setInterval(function() {
+    }, 1000);
+
+    return function() { clearInterval(pollId); };
+  }, []);
+
+  // ─── LOCAL TICK between polls (smooth countdown, overridden by server every 1s) ───
+  useEffect(function() {
+    if (timer.timer_status !== "running") return;
+    var localTick = setInterval(function() {
+      setSecs(function(prev) { return Math.max(0, prev - 1); });
+    }, 1000);
+    return function() { clearInterval(localTick); };
+  }, [timer.timer_status]);
+
+  // ─── POLL DATA (activities + pomos) every 8 seconds ───
+  useEffect(function() {
+    var t = setInterval(function() {
       sb(T_LOG, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(r) { if (r && Array.isArray(r)) setLogs(r); });
       sb(T_POMO, "GET", null, "order=date.desc,start_time.asc&limit=5000").then(function(r) { if (r && Array.isArray(r)) setPomos(r); });
     }, 8000);
-    return function() { clearInterval(t1); clearInterval(t2); };
+    return function() { clearInterval(t); };
   }, []);
-
-  // ─── TIMER TICK (uses server time offset for precision) ───
-  useEffect(function() {
-    function calc() {
-      if (timer.timer_status === "running" && timer.started_at) {
-        var startedMs = new Date(timer.started_at).getTime();
-        var nowMs = serverNow();
-        var elapsed = Math.floor((nowMs - startedMs) / 1000);
-        var rem = Math.max(0, timer.duration_seconds - elapsed);
-        setSecs(rem);
-        if (rem <= 0) onTimerDone();
-      } else if (timer.timer_status === "paused" && timer.paused_remaining != null) {
-        setSecs(timer.paused_remaining);
-      } else if (timer.timer_status === "idle") {
-        setSecs(timer.duration_seconds || focusDur * 60);
-      } else if (timer.timer_status === "completed") {
-        setSecs(0);
-      }
-    }
-    calc();
-    tickRef.current = setInterval(calc, 500);
-    return function() { clearInterval(tickRef.current); };
-  }, [timer]);
 
   // ─── SHOW REVIEW ON COMPLETE ───
   useEffect(function() {
@@ -147,8 +156,8 @@ export default function App() {
   // ─── TIMER CONTROLS ───
   function updateTimer(fields) {
     var updated = Object.assign({}, timer, fields);
-    setTimer(updated); // instant local update
-    sb(T_TIMER, "PATCH", fields, "id=eq.main"); // fire to DB
+    setTimer(updated);
+    sb(T_TIMER, "PATCH", fields, "id=eq.main");
   }
 
   function onTimerDone() {
@@ -158,8 +167,6 @@ export default function App() {
 
   function startFocus() {
     var startTime = now12();
-    var serverStart = new Date(serverNow()).toISOString();
-    // AUTO-LOG: record session start immediately in timeline
     var logEntry = {
       id: gId(), name: "🎯 جلسة تركيز", description: "بومودورو", category: "work",
       start_time: startTime, end_time: startTime, date: today(), status: "in_progress",
@@ -169,26 +176,25 @@ export default function App() {
     setLogs(function(p) { return [logEntry].concat(p); });
     sb(T_LOG, "POST", logEntry);
 
+    // Use server NOW() by setting started_at to current time
+    // The server function get_timer_state() uses NOW() - started_at
     updateTimer({
       timer_status: "running", session_type: "focus", duration_seconds: focusDur * 60,
-      started_at: serverStart, paused_remaining: null,
+      started_at: new Date().toISOString(), paused_remaining: null,
     });
     setShowReview(false);
   }
 
   function startBreak(type) {
     var dur = type === "long_break" ? longBrk * 60 : shortBrk * 60;
-    var serverStart = new Date(serverNow()).toISOString();
-    updateTimer({ timer_status: "running", session_type: type, duration_seconds: dur, started_at: serverStart, paused_remaining: null });
+    updateTimer({ timer_status: "running", session_type: type, duration_seconds: dur, started_at: new Date().toISOString(), paused_remaining: null });
   }
 
   function onStart() {
     if (timer.timer_status === "idle" || timer.timer_status === "completed") startFocus();
     else if (timer.timer_status === "paused") {
       var rem = timer.paused_remaining || secs;
-      // Calculate started_at based on server time so all devices match
-      var serverStart = new Date(serverNow() - (timer.duration_seconds - rem) * 1000).toISOString();
-      updateTimer({ timer_status: "running", started_at: serverStart, paused_remaining: null });
+      updateTimer({ timer_status: "running", started_at: new Date(Date.now() - (timer.duration_seconds - rem) * 1000).toISOString(), paused_remaining: null });
     }
   }
   function onPause() { updateTimer({ timer_status: "paused", paused_remaining: secs }); }
